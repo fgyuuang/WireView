@@ -28,6 +28,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1714,84 +1715,82 @@ public:
         bool annex_b{false};
     };
 
-    [[nodiscard]] Output take_output() {
-        for (unsigned attempt = 0U; attempt < 2U; ++attempt) {
-            ComPtr<IMFSample> allocated_sample;
-            const bool transform_provides_sample =
-                (output_info_.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
-                                         MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0U;
-            if (!transform_provides_sample) {
-                check_hresult(MFCreateSample(&allocated_sample), "MFCreateSample(output)");
-                const std::uint64_t native_size =
-                    static_cast<std::uint64_t>(width_) * static_cast<std::uint64_t>(height_) * 2U;
-                const DWORD buffer_size = static_cast<DWORD>(std::min<std::uint64_t>(
-                    std::max<std::uint64_t>(output_info_.cbSize, native_size),
-                    std::numeric_limits<DWORD>::max()));
-                ComPtr<IMFMediaBuffer> buffer;
-                check_hresult(MFCreateMemoryBuffer(buffer_size, &buffer),
-                              "MFCreateMemoryBuffer(output)");
-                check_hresult(allocated_sample->AddBuffer(buffer.Get()),
-                              "IMFSample::AddBuffer(output)");
-            }
-
-            MFT_OUTPUT_DATA_BUFFER output_data{};
-            output_data.dwStreamID = 0;
-            output_data.pSample = allocated_sample.Get();
-            DWORD status = 0;
-            const HRESULT result = transform_->ProcessOutput(0, 1, &output_data, &status);
-            if (output_data.pEvents != nullptr) {
-                output_data.pEvents->Release();
-            }
-            if (result == MF_E_TRANSFORM_STREAM_CHANGE) {
-                std::cout << "IMFTransform::ProcessOutput requested output-format change"
-                          << " | status=" << hresult_text(static_cast<HRESULT>(status)) << '\n';
-                if ((status & MFT_PROCESS_OUTPUT_STATUS_NEW_STREAMS) != 0U) {
-                    throw std::runtime_error(
-                        "hardware encoder created a new output stream, which WireView does not support");
-                }
-                renegotiate_output_type();
-                continue;
-            }
-            if (FAILED(result) && attempt > 0U) {
-                throw std::runtime_error(
-                    "IMFTransform::ProcessOutput failed after output-format renegotiation: " +
-                    hresult_text(result));
-            }
-            check_hresult(result, "IMFTransform::ProcessOutput");
-
-            ComPtr<IMFSample> sample;
-            if (output_data.pSample == allocated_sample.Get()) {
-                sample = allocated_sample;
-            } else {
-                sample.Attach(output_data.pSample);
-            }
-            if (!sample) {
-                throw std::runtime_error("hardware encoder returned no output sample");
-            }
-
-            Output output;
-            if (FAILED(sample->GetSampleTime(&output.timestamp))) {
-                output.timestamp = -1;
-            }
-            output.keyframe = MFGetAttributeUINT32(
-                sample.Get(), MFSampleExtension_CleanPoint, FALSE) != FALSE;
-
-            ComPtr<IMFMediaBuffer> contiguous;
-            check_hresult(sample->ConvertToContiguousBuffer(&contiguous),
-                          "IMFSample::ConvertToContiguousBuffer");
-            BYTE* data = nullptr;
-            DWORD capacity = 0;
-            DWORD current_length = 0;
-            check_hresult(contiguous->Lock(&data, &capacity, &current_length),
-                          "IMFMediaBuffer::Lock(output)");
-            output.annex_b = current_length >= 4U && data[0] == 0U && data[1] == 0U &&
-                             ((data[2] == 1U) || (data[2] == 0U && data[3] == 1U));
-            output.bytes.assign(data, data + current_length);
-            check_hresult(contiguous->Unlock(), "IMFMediaBuffer::Unlock(output)");
-            return output;
+    [[nodiscard]] std::optional<Output> take_output() {
+        ComPtr<IMFSample> allocated_sample;
+        const bool transform_provides_sample =
+            (output_info_.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
+                                     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0U;
+        if (!transform_provides_sample) {
+            check_hresult(MFCreateSample(&allocated_sample), "MFCreateSample(output)");
+            const std::uint64_t native_size =
+                static_cast<std::uint64_t>(width_) * static_cast<std::uint64_t>(height_) * 2U;
+            const DWORD buffer_size = static_cast<DWORD>(std::min<std::uint64_t>(
+                std::max<std::uint64_t>(output_info_.cbSize, native_size),
+                std::numeric_limits<DWORD>::max()));
+            ComPtr<IMFMediaBuffer> buffer;
+            check_hresult(MFCreateMemoryBuffer(buffer_size, &buffer),
+                          "MFCreateMemoryBuffer(output)");
+            check_hresult(allocated_sample->AddBuffer(buffer.Get()),
+                          "IMFSample::AddBuffer(output)");
         }
-        throw std::runtime_error(
-            "hardware encoder repeated its output-format change after renegotiation");
+
+        MFT_OUTPUT_DATA_BUFFER output_data{};
+        output_data.dwStreamID = 0;
+        output_data.pSample = allocated_sample.Get();
+        DWORD status = 0;
+        const HRESULT result = transform_->ProcessOutput(0, 1, &output_data, &status);
+        ComPtr<IMFSample> sample;
+        if (output_data.pSample == allocated_sample.Get()) {
+            sample = allocated_sample;
+        } else {
+            sample.Attach(output_data.pSample);
+        }
+        if (output_data.pEvents != nullptr) {
+            output_data.pEvents->Release();
+        }
+        if (result == MF_E_TRANSFORM_STREAM_CHANGE) {
+            if (output_format_change_pending_) {
+                throw std::runtime_error(
+                    "hardware encoder repeated its output-format change after renegotiation");
+            }
+            std::cout << "IMFTransform::ProcessOutput requested output-format change"
+                      << " | status=" << hresult_text(static_cast<HRESULT>(status)) << '\n';
+            if ((status & MFT_PROCESS_OUTPUT_STATUS_NEW_STREAMS) != 0U) {
+                throw std::runtime_error(
+                    "hardware encoder created a new output stream, which WireView does not support");
+            }
+            renegotiate_output_type();
+            output_format_change_pending_ = true;
+            // Async MFTs require one ProcessOutput call per HaveOutput event,
+            // including a call that reports a format change.
+            return std::nullopt;
+        }
+        check_hresult(result, "IMFTransform::ProcessOutput");
+        output_format_change_pending_ = false;
+        if (!sample) {
+            throw std::runtime_error("hardware encoder returned no output sample");
+        }
+
+        Output output;
+        if (FAILED(sample->GetSampleTime(&output.timestamp))) {
+            output.timestamp = -1;
+        }
+        output.keyframe = MFGetAttributeUINT32(
+            sample.Get(), MFSampleExtension_CleanPoint, FALSE) != FALSE;
+
+        ComPtr<IMFMediaBuffer> contiguous;
+        check_hresult(sample->ConvertToContiguousBuffer(&contiguous),
+                      "IMFSample::ConvertToContiguousBuffer");
+        BYTE* data = nullptr;
+        DWORD capacity = 0;
+        DWORD current_length = 0;
+        check_hresult(contiguous->Lock(&data, &capacity, &current_length),
+                      "IMFMediaBuffer::Lock(output)");
+        output.annex_b = current_length >= 4U && data[0] == 0U && data[1] == 0U &&
+                         ((data[2] == 1U) || (data[2] == 0U && data[3] == 1U));
+        output.bytes.assign(data, data + current_length);
+        check_hresult(contiguous->Unlock(), "IMFMediaBuffer::Unlock(output)");
+        return output;
     }
 
     void drain() {
@@ -1851,6 +1850,7 @@ private:
     bool direct3d_aware_{false};
     bool low_latency_enabled_{false};
     bool first_input_submitted_{false};
+    bool output_format_change_pending_{false};
     bool started_{false};
     bool draining_{false};
 };
@@ -2145,7 +2145,11 @@ int run_desktop_encode_session(
         }
 
         if (event == METransformHaveOutput) {
-            const HardwareAvcEncoder::Output output = encoder->take_output();
+            const auto pending_output = encoder->take_output();
+            if (!pending_output) {
+                continue;
+            }
+            const HardwareAvcEncoder::Output& output = *pending_output;
             ++encoded;
             total_bytes += output.bytes.size();
             keyframes += output.keyframe ? 1U : 0U;
